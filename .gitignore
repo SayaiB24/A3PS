@@ -1,0 +1,14 @@
+# Virtual environment
+myenv/
+
+# Experiment runs and extra data
+runs/
+Extra-Data/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Notes and large model files
+FYP_NOTES.txt
+*.pt

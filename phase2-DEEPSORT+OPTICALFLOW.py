@@ -7,7 +7,7 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 model = YOLO('yolov8n-seg.pt') 
 tracker = DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0) 
 
-cap = cv2.VideoCapture('00133.mp4')
+cap = cv2.VideoCapture('Extra-Data\\00318.mp4')
 
 # --- OPTICAL FLOW SETUP ---
 # Parameters for Lucas-Kanade optical flow

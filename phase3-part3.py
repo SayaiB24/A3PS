@@ -1,28 +1,31 @@
 import cv2
 import numpy as np
-import time  # For calculating real-time FPS
-import torch # --- ADDED: For Phase 3 Tensors ---
+import time  
+import torch 
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import csv
 import torch.nn as nn
 
-# --- ADDED: PHASE 3 DATA BRIDGE FUNCTION ---
+# =========================================================
+# PHASE 3: DATA BRIDGE FUNCTION
+# =========================================================
 def prepare_trajectory_tensors(trajectory_history, history_length=30):
-    """Converts the Python dictionary into PyTorch tensors for the Transformer."""
+    """Converts the Python dictionary into PyTorch tensors and returns track IDs."""
     valid_tracks = []
+    valid_ids = [] 
     
     for track_id, history in trajectory_history.items():
         if len(history) >= history_length:
             recent_history = history[-history_length:]
             valid_tracks.append(recent_history)
+            valid_ids.append(track_id) 
             
     if not valid_tracks:
-        return None 
+        return None, None 
         
-    # Shape: [Number of Vehicles, History Length, 4 Features]
     input_tensor = torch.tensor(np.array(valid_tracks), dtype=torch.float32)
-    return input_tensor
+    return input_tensor, valid_ids 
 
 # =========================================================
 # PHASE 3: TRANSFORMER ARCHITECTURE DEFINITION
@@ -60,9 +63,6 @@ class TrajectoryTransformer(nn.Module):
 # --- INITIALIZE MODELS ---
 model = YOLO('yolov8n.pt') 
 tracker = DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0) 
-
-# --- ADD THIS LINE ---
-# Initialize the untrained Phase 3 Transformer
 trajectory_model = TrajectoryTransformer()
 
 cap = cv2.VideoCapture('Extra-Data\\00318.mp4')
@@ -83,17 +83,17 @@ old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
 h_img, w_img = old_gray.shape[:2]
 
 # --- GLOBAL DATA PERSISTENCE ---
-vehicle_kinematics = {}  # Keeps track of velocities across frames
-trajectory_history = {}  # --- ADDED: Stores the rolling time window for Phase 3 ---
-MAX_HISTORY_FRAMES = 30  # --- ADDED: Minimum frames needed to make a prediction ---
+vehicle_kinematics = {}  
+trajectory_history = {}  
+MAX_HISTORY_FRAMES = 30  
 
 # --- SEPARATED CLASS-BASED DISPLAY ID MAPPING ---
-deepsort_to_display_label = {}  # Maps raw DeepSORT ID string to labeled string
-next_vehicle_id = 1             # Counter for vehicles
-next_pedestrian_id = 1          # Counter for pedestrians
+deepsort_to_display_label = {}  
+next_vehicle_id = 1             
+next_pedestrian_id = 1          
 
 # --- FPS COUNTER VARIABLES ---
-prev_time = 0  # Timestamp of the previous frame calculated
+prev_time = 0  
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -163,7 +163,7 @@ while cap.isOpened():
                 del vehicle_kinematics[track_id]
             if track_id in deepsort_to_display_label:
                 del deepsort_to_display_label[track_id]
-            if track_id in trajectory_history: # --- ADDED: Clean up memory here too ---
+            if track_id in trajectory_history: 
                 del trajectory_history[track_id]
             continue
 
@@ -220,15 +220,13 @@ while cap.isOpened():
                             
                         vehicle_kinematics[track_id] = (velocity_x, velocity_y)
 
-                        # --- ADDED: STORE IN MEMORY (For Phase 3 Data Bridge) ---
+                        # --- STORE IN MEMORY (For Phase 3 Data Bridge) ---
                         if track_id not in trajectory_history:
                             trajectory_history[track_id] = []
                             
-                        # Store current coordinates and velocities
                         current_state = (float(x1), float(y1), velocity_x, velocity_y)
                         trajectory_history[track_id].append(current_state)
                         
-                        # Maintain rolling window size
                         if len(trajectory_history[track_id]) > MAX_HISTORY_FRAMES:
                             trajectory_history[track_id].pop(0)
                         # --------------------------------------------------------
@@ -237,40 +235,62 @@ while cap.isOpened():
                         cv2.putText(annotated_frame, metrics_text, (x1, y2 + 15), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
-    # --- ADDED: EXECUTE PHASE 3 DATA BRIDGE ---
-    # Convert our Python dictionary into an active PyTorch Tensor
-    past_trajectories_tensor = prepare_trajectory_tensors(trajectory_history, history_length=MAX_HISTORY_FRAMES)
+    # =========================================================
+    # MEMORY CLEANUP (Fixes the Ghost Lines!)
+    # =========================================================
+    stale_ids = [tid for tid in trajectory_history.keys() if tid not in active_current_ids]
+    for tid in stale_ids:
+        del trajectory_history[tid] 
+        if tid in vehicle_kinematics:
+            del vehicle_kinematics[tid]
+
+    # =========================================================
+    # EXECUTE PHASE 3 DATA BRIDGE & INFERENCE 
+    # =========================================================
+    past_trajectories_tensor, valid_ids = prepare_trajectory_tensors(trajectory_history, history_length=MAX_HISTORY_FRAMES)
     
     if past_trajectories_tensor is not None:
-        # 1. We have the past 30 frames of data
-        tensor_text = f"Input Ready: {past_trajectories_tensor.shape}"
-        
-        # 2. Feed it into the Transformer to predict the next 90 frames!
-        with torch.no_grad(): # We are just predicting, not training
+        # 1. Feed it into the Transformer to predict the next 90 frames
+        with torch.no_grad():
             future_predictions = trajectory_model(past_trajectories_tensor)
             
-        print(f"SUCCESS: Predicted {future_predictions.shape[1]} future frames for {future_predictions.shape[0]} vehicles.")
-    
-    # --- DRAW THE MONITORING OVERLAYS ---
-    cv2.rectangle(annotated_frame, (10, 10), (320, 75), (0, 0, 0), -1)  # Expanded background block
-    
-    # 1. FPS Text
-    fps_text = f"System Performance: {fps:.1f} FPS"
-    cv2.putText(annotated_frame, fps_text, (20, 33), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # 2. VISUALIZE THE OUTPUT (Draw the predicted paths)
+        for batch_idx, track_id in enumerate(valid_ids):
+            current_x = trajectory_history[track_id][-1][0]
+            current_y = trajectory_history[track_id][-1][1]
+            
+            predicted_path = future_predictions[batch_idx].numpy() 
+            prev_pt = (int(current_x), int(current_y))
+            
+            for i in range(len(predicted_path)):
+                dx = int(predicted_path[i][0] * 15) 
+                dy = int(predicted_path[i][1] * 15)
                 
-    # 2. Phase 3 Tensor Readiness Text
+                next_pt = (prev_pt[0] + dx, prev_pt[1] + dy)
+                
+                cv2.line(annotated_frame, prev_pt, next_pt, (255, 0, 255), 2)
+                cv2.circle(annotated_frame, next_pt, 2, (0, 255, 255), -1)
+                prev_pt = next_pt
+
+        # --- THE CLEANED-UP UI DRAWING (Dynamic Info) ---
+        cv2.putText(annotated_frame, f"Visualizing {len(valid_ids)} random paths", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+        
+    # =========================================================
+    # DRAW THE MONITORING OVERLAYS (Static Background & Status)
+    # =========================================================
+    cv2.rectangle(annotated_frame, (10, 10), (350, 100), (0, 0, 0), -1) 
+    
+    fps_text = f"System Performance: {fps:.1f} FPS"
+    cv2.putText(annotated_frame, fps_text, (20, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
     if past_trajectories_tensor is not None:
         tensor_text = f"Tensor Ready: {past_trajectories_tensor.shape}"
-        cv2.putText(annotated_frame, tensor_text, (20, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, tensor_text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     else:
         tensor_text = "Collecting Tensor Data..."
-        cv2.putText(annotated_frame, tensor_text, (20, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    # -------------------------------------------
+        cv2.putText(annotated_frame, tensor_text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    cv2.imshow("A3PS Phase I & II: DeepSORT + Optical Flow", annotated_frame)
+    cv2.imshow("A3PS Phase I, II & III: Untrained Inference", annotated_frame)
     old_gray = frame_gray.copy()
     
     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -282,20 +302,15 @@ cv2.destroyAllWindows()
 # =========================================================
 # GRACEFUL SHUTDOWN: Save RAM data to Physical Storage
 # =========================================================
-'''print("\nInitiating graceful shutdown...")
+print("\nInitiating graceful shutdown...")
 print("Saving in-memory trajectory history to physical CSV file...")
 
-# Open (or create) a new CSV file in 'write' mode
 with open('final_ram_dump_trajectories.csv', 'w', newline='') as csv_file:
     writer = csv.writer(csv_file)
-    
-    # 1. Write the Header Row
     writer.writerow(['Track_ID', 'Window_Index', 'X_Coord', 'Y_Coord', 'Velocity_X', 'Velocity_Y'])
     
-    # 2. Extract data from RAM and write to disk
     row_count = 0
     for track_id, history_list in trajectory_history.items():
-        # Enumerate gives us an index (0 to 29) for the rolling window
         for index, state in enumerate(history_list):
             x, y, vx, vy = state
             writer.writerow([track_id, index, x, y, vx, vy])
@@ -303,5 +318,3 @@ with open('final_ram_dump_trajectories.csv', 'w', newline='') as csv_file:
 
 print(f"Successfully saved {row_count} data points to 'final_ram_dump_trajectories.csv'!")
 print("System fully shut down.")
-#for this code end the cmd with ctrl+Q'''
-
